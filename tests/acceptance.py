@@ -301,7 +301,10 @@ class Acceptance(unittest.TestCase):
         ipv6_alias=next(m['target'] for m in self.machines() if m['id']!='unrelated' and m['target']!=alias)
         parsed=subprocess.run(['ssh','-G','-F',str(ssh),ipv6_alias],env=self.env,text=True,capture_output=True,check=True)
         self.assertIn('hostname fd7a:115c:a1e0::26',parsed.stdout)
-        self.assertNotIn('proxycommand ',parsed.stdout)
+        # Match setting names, not substrings (macOS reports
+        # nohostauthenticationforproxycommand even for direct SSH connections).
+        settings={line.split(None,1)[0] for line in parsed.stdout.splitlines() if line.strip()}
+        self.assertNotIn('proxycommand',settings)
         self.assertEqual(next(m['id'] for m in self.machines() if m['target']==alias),old_id)
         for peer in data['Peer'].values(): peer['Online']=False
         (self.home/'tailscale.json').write_text(json.dumps(data))
