@@ -1,6 +1,6 @@
 # hwatch
 
-A small [MatchBox](https://github.com/ortus-boxlang/matchbox) CLI that keeps selected **KubeVirt VirtualMachines** available in OpenSSH and [Herdr](https://herdr.dev). It shells out to your existing tools; no Kubernetes or cloud SDK is bundled.
+A small [MatchBox](https://github.com/ortus-boxlang/matchbox) CLI that keeps selected **KubeVirt VirtualMachines** and **tagged Tailscale machines** available in OpenSSH and [Herdr](https://herdr.dev). It shells out to your existing tools; no Kubernetes or Tailscale SDK is bundled.
 
 ## Install a release
 
@@ -37,7 +37,12 @@ matchbox --target native --output dist/hwatch src/main.bxs
 
 For development, replace `hwatch` below with `matchbox src/main.bxs`, or run the compiled `./dist/hwatch` directly. To install, copy the executable to a user-owned directory on your `PATH`.
 
-The executable needs `kubectl`, `virtctl`, `herdr`, OpenSSH (`ssh`), and standard Unix `sh`/`mkdir` on `PATH`. It also needs your kubeconfig, cluster access, and normal SSH credentials. No MatchBox, Java, Python, Rust, or SDK is needed to run the native application. The currently tested artifact is **Linux x86-64 GNU**, with normal system shared-library requirements; other platforms have not been validated.
+The executable needs `herdr`, OpenSSH (`ssh`), and standard Unix `sh`/`mkdir` on `PATH`, plus the tools for your profile types:
+
+- **KubeVirt:** `kubectl`, `virtctl`, a kubeconfig, and cluster access.
+- **Tailscale:** `tailscale`, with its daemon running and logged into your tailnet.
+
+Both sources need normal SSH access to the destination. Doctor checks only the tools required by configured profile types. No MatchBox, Java, Python, Rust, or SDK is needed to run the native application. The currently tested artifact is **Linux x86-64 GNU**, with normal system shared-library requirements; other platforms have not been validated.
 
 ## Quick start
 
@@ -46,7 +51,7 @@ hwatch profile new lab
 hwatch doctor
 ```
 
-The wizard lists contexts and asks for:
+The wizard first asks for the watch source: **KubeVirt** (default) or **Tailscale**. For KubeVirt, it lists contexts and asks for:
 
 - Kubernetes context;
 - namespace (`*` for all namespaces);
@@ -56,7 +61,9 @@ The wizard lists contexts and asks for:
 - SSH port (default `22`);
 - whether to include stopped VMs (default **yes**).
 
-It validates discovery access before saving. Your account needs permission to list both `virtualmachines` and `virtualmachineinstances` in the configured scope. Labels are selected on the **VirtualMachine** resource; they do not need to be copied to the VMI.
+For Tailscale, it asks for an exact tag such as `tag:devbox`, the same SSH connection settings, and whether to keep offline machines (default **yes**).
+
+It validates discovery access before saving. KubeVirt accounts need permission to list both `virtualmachines` and `virtualmachineinstances` in the configured scope. Labels are selected on the **VirtualMachine** resource; they do not need to be copied to the VMI. Connecting also requires `get` access to `virtualmachines/portforward` in the `subresources.kubevirt.io` API group; discovery checks do not prove port-forward permission.
 
 Doctor prints the SSH snippet to copy/paste near the top of `~/.ssh/config`, **before other `Host` or `Match` blocks**:
 
@@ -75,7 +82,7 @@ hwatch run
 
 Doctor may initially report the generated file missing. After the first reconciliation, it uses real OpenSSH parsing to check that the include is read and that existing managed hosts' hostname, user, port, and proxy command have not been overridden by earlier settings. `Host *` resets matching scope, not already assigned SSH values or syntax errors.
 
-Before unattended registration can succeed, the VM must offer SSH and have a compatible Herdr installation. Unknown host keys, unloaded/passphrase-protected keys, authentication failures, missing Herdr installations, or incompatible remote servers may require manual setup. hwatch reports the manual `herdr machine add ...` command and retries; it does not approve prompts or automatically replace remote software.
+Before unattended registration can succeed, the destination must offer SSH and have a compatible Herdr installation. Unknown host keys, unloaded/passphrase-protected keys, authentication failures, missing Herdr installations, or incompatible remote servers may require manual setup. hwatch reports the manual `herdr machine add ...` command and retries; it does not approve prompts or automatically replace remote software.
 
 ## Commands
 
@@ -90,13 +97,13 @@ hwatch run [--once] [--poll-seconds 120]
 hwatch doctor
 ```
 
-Profile names use 1–40 lowercase letters, digits, or hyphens, starting with a letter or digit. Use different profiles for different clusters, namespace scopes, or selectors.
+Profile names use 1–40 lowercase letters, digits, or hyphens, starting with a letter or digit. Use different profiles for different clusters, namespace scopes, selectors, or Tailscale tags. KubeVirt and Tailscale profiles can run together.
 
 - `profile where` prints only the existing profile's path.
 - `profile show` displays readable JSON. Edit the file directly to change settings; the watcher reloads profiles on every poll.
 - `profile remove` asks for confirmation, removes only that profile's owned connections, then deletes its configuration. It refuses to race with a running reconciler. Remote sessions are not stopped.
 - `run` polls immediately, then sleeps between passes. The default delay is 120 seconds **after each pass**, not a fixed-rate schedule.
-- `run --once` exits 0 when reconciliation succeeds and nonzero for discovery, setup, or reconciliation failures. A stopped VM awaiting its first registration is not an error.
+- `run --once` exits 0 when reconciliation succeeds and nonzero for discovery, setup, or reconciliation failures. A stopped VM or offline Tailscale peer awaiting its first registration is not an error.
 - `doctor` performs diagnostics without writing hwatch configuration, SSH files, or machine entries. It exits nonzero when setup needs attention.
 
 ## Configuration and storage
@@ -110,10 +117,13 @@ Profile names use 1–40 lowercase letters, digits, or hyphens, starting with a 
 
 Unset, empty, or relative XDG paths use the defaults. Keep the state journal: it records actual Herdr profile IDs and pending add attempts. hwatch does not infer IDs from labels, edit Herdr's catalog directly, or adopt an unrelated entry merely because its SSH target matches.
 
-Example profile:
+### KubeVirt profiles
+
+Existing profiles without a `type` field continue to work as `kubevirt` profiles, without rewriting the files or changing VM aliases. New profiles explicitly include the type:
 
 ```json
 {
+  "type": "kubevirt",
   "context": "my-k3s",
   "namespace": "dev",
   "selector": "hwatch=enabled",
@@ -142,7 +152,30 @@ Host hw-lab.dev.devbox
     ProxyCommand virtctl --context 'my-k3s' --namespace 'dev' port-forward --stdio=true 'vm/devbox' %p
 ```
 
+### Tailscale profiles
+
+```json
+{
+  "type": "tailscale",
+  "tag": "tag:devbox",
+  "user": "jacob",
+  "identityFile": "",
+  "port": 22,
+  "includeOffline": true
+}
+```
+
+hwatch runs `tailscale status --json` and selects visible peers with an **exact, case-sensitive** match in their `Tags` array. It excludes the local machine. Discovery is limited to the peers visible to your local Tailscale client, not a tailnet-wide administrative inventory.
+
+Connections use ordinary SSH over Tailscale: `HostName` is the peer's Tailscale IPv4 address, falling back to IPv6 for IPv6-only peers. No proxy command, MagicDNS lookup, `tailscale ssh`, or Tailscale SSH configuration change is needed. Tailnet network policy and the destination's SSH authentication still apply.
+
+An alias has the form `hw-<profile>.<initial-hostname>-<node-id-hash>`. The hostname is sanitized and the suffix is 12 hex characters from SHA-256 of the stable peer `ID`, distinguishing machines with the same hostname. The journal records the stable ID and preserves that alias across hostname, public-key, or IP changes. Keep the journal to preserve these initial aliases. Any detected alias collision fails discovery rather than merging machines.
+
+Tailscale profile settings can be edited using the path printed by `hwatch profile where <name>`, just like KubeVirt profiles. Unknown profile types are rejected rather than interpreted as KubeVirt.
+
 ## Reconciliation behavior
+
+### KubeVirt
 
 | VM condition | `includeStopped: true` (default) | `includeStopped: false` |
 | --- | --- | --- |
@@ -153,6 +186,20 @@ Host hw-lab.dev.devbox
 | Cluster query fails or returns malformed data | Preserve that profile's previous entries; continue other profiles | Same |
 
 A VMI in phase `Running` is eligible for an add attempt, not proof SSH or Herdr is ready. Those failures are retried on subsequent polls.
+
+### Tailscale
+
+| Peer condition | `includeOffline: true` (default) | `includeOffline: false` |
+| --- | --- | --- |
+| Matching, online | Generate SSH; add to Herdr if necessary | Same |
+| Offline, previously registered | Keep SSH and Herdr entries | Remove owned SSH/Herdr entries |
+| Offline, never registered | Generate SSH; defer registration until online | No entries |
+| Missing from peer list or no longer tagged | Remove owned entries | Same |
+| Daemon/query failure, not logged in/running, or invalid status data | Preserve previous entries; continue other profiles | Same |
+
+`Online` means connected to the Tailscale control plane, not proof that SSH or Herdr is ready. Failed registration is retried. An explicitly empty peer map from a running daemon means no peers; a missing/invalid peer map is a discovery failure, not an empty inventory.
+
+### Shared safety rules
 
 The include and journal are published with same-directory atomic renames and are not rewritten when unchanged. A pre-existing `hwatch.conf` without hwatch's generated marker is not overwritten. Subprocess arguments are passed as arrays, and generated proxy arguments are shell-quoted with OpenSSH percent expansion accounted for.
 
@@ -178,11 +225,11 @@ python3 tests/install.py
 
 Optional Make targets provide `build`, `test`, and `check` if Make is installed.
 
-The acceptance suite exercises the public CLI in disposable home directories. Kubernetes and Herdr are controlled command substitutes; OpenSSH is real, including an actual proxy-command invocation that verifies quoting. The scenarios cover polling/reloaded settings, independent profiles, discovery-failure preservation, stopped VM transitions, registration retry, ownership boundaries, cleanup, and read-only doctor diagnostics.
+The acceptance suite exercises the public CLI in disposable home directories. Kubernetes, Tailscale, and Herdr are controlled command substitutes; OpenSSH is real, including an actual proxy-command invocation that verifies quoting and parsing of ordinary IPv4/IPv6 host entries. The scenarios cover polling/reloaded settings, mixed-source profiles, discovery-failure preservation, stopped/offline transitions, exact Tailscale tag matching, stable peer identity across renames, registration retry, ownership boundaries, cleanup, and read-only doctor diagnostics.
 
 The source-free check stages a copy of the source, builds bytecode and a native executable, removes the staged source, and runs the acceptance suite in both modes. The native pass uses a tool-only `PATH` without MatchBox, Java, Rust, or SDK tools.
 
-**Not yet verified:** end-to-end registration against a live KubeVirt VM and real Herdr remote setup; macOS/Windows; signal-clean lock cleanup. No live machines are added or removed by the tests.
+**Not yet verified locally:** end-to-end registration against a live KubeVirt VM or Tailscale peer and real Herdr remote setup; macOS/Windows; signal-clean lock cleanup. No live machines are added or removed by the tests.
 
 ## CI and releases
 
@@ -204,6 +251,6 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Tagged releases require GitHub Actions to be enabled and the workflow's release job to receive `contents: write` permission. An immutable version tag should point to the intended reviewed commit. No release has been published as part of local setup, and remote CI/macOS/ARM64 execution is still pending until the workflow runs.
+Tagged releases require GitHub Actions to be enabled and the workflow's release job to receive `contents: write` permission. An immutable version tag should point to the intended reviewed commit. This Tailscale change has been verified locally on Linux x86-64; macOS/ARM64 execution is gated by the workflow's actual-runner tests.
 
 See [BUILD.md](BUILD.md) for the local build identity.

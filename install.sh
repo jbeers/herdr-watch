@@ -83,7 +83,7 @@ main() {
         *) printf 'Add this directory to PATH in your shell configuration: %s\n' "$bin_dir" ;;
     esac
     printf '%s\n' 'Next: hwatch profile new <name>, then hwatch doctor.' \
-        'Runtime tools required: kubectl, virtctl, herdr, ssh, sh, mkdir.'
+        'Required tools: herdr, ssh, sh, mkdir. KubeVirt profiles: kubectl + virtctl. Tailscale profiles: tailscale.'
 }
 
 main "$@"

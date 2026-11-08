@@ -26,6 +26,10 @@ if name == 'kubectl':
  data = json.loads((home/'cluster.json').read_text())
  if data.get('fail') or 'unavailable' in a: print('cluster unavailable', file=sys.stderr); sys.exit(1)
  print(json.dumps(data['vmi' if 'vmi' in a else 'vm']))
+elif name == 'tailscale':
+ if a != ['status','--json']: print('unexpected tailscale arguments',file=sys.stderr); sys.exit(1)
+ if (home/'tailscale-fails').exists(): print('daemon unavailable',file=sys.stderr); sys.exit(1)
+ print((home/'tailscale.json').read_text())
 elif name == 'herdr':
  if '--help' in a: print('machine list --json; add --remote-session --label; remove'); sys.exit()
  p=home/'machines.json'
@@ -51,7 +55,7 @@ class Acceptance(unittest.TestCase):
         bin_dir = self.home/'bin'
         bin_dir.mkdir()
         self.env['PATH'] = str(bin_dir)+os.pathsep+os.environ['PATH']
-        for tool in ['kubectl', 'virtctl', 'herdr']:
+        for tool in ['kubectl', 'virtctl', 'herdr', 'tailscale']:
             p=bin_dir/tool
             p.write_text(FAKE)
             p.chmod(0o755)
@@ -79,7 +83,7 @@ class Acceptance(unittest.TestCase):
 
     def test_profile_wizard_and_read_only_doctor(self):
         self.assertIn('hwatch', self.call('--help').stdout)
-        self.call('profile','new','lab',input='lab\ndev\nhwatch=enabled\njacob\n\n\n\n\ny\n')
+        self.call('profile','new','lab',input='1\nlab\ndev\nhwatch=enabled\njacob\n\n\n\n\ny\n')
         p=self.home/'config/hwatch/profiles/lab.json'
         self.assertTrue(json.loads(p.read_text())['includeStopped'])
         self.assertEqual(self.call('profile','where','lab').stdout.strip(), str(p))
@@ -226,6 +230,129 @@ class Acceptance(unittest.TestCase):
         wait_for(lambda: len(self.machines())==1)
         process.terminate()
         process.wait(timeout=5)
+
+    def tailscale_profile(self, offline=None):
+        folder=self.home/'config/hwatch/profiles'
+        folder.mkdir(parents=True,exist_ok=True)
+        config=dict(type='tailscale',tag='tag:devbox',user='jacob',port=22,identityFile='')
+        if offline is not None: config['includeOffline']=offline
+        (folder/'tailnet.json').write_text(json.dumps(config))
+
+    def tailnet(self, online=True, tagged=True):
+        peer=dict(ID='nStable123',HostName='buildbox',DNSName='buildbox.example.ts.net.',Tags=['tag:devbox'] if tagged else [],Online=online,TailscaleIPs=['100.64.0.20','fd7a:115c:a1e0::20'])
+        data=dict(BackendState='Running',Self=dict(ID='nSelf'),Peer={
+            'nodekey:rotating':peer,
+            'nodekey:untagged':dict(peer,ID='nOther',Tags=['tag:devbox-other']),
+            'nodekey:wrong-case':dict(peer,ID='nCase',Tags=['tag:Devbox']),
+            'nodekey:self':dict(peer,ID='nSelf'),
+        })
+        (self.home/'tailscale.json').write_text(json.dumps(data))
+        return data
+
+    def test_tailscale_wizard_doctor_and_profile_display(self):
+        self.tailnet()
+        self.call('profile','new','tailnet',input='2\ntag:devbox\njacob\n\n\n\n\ny\n')
+        config=json.loads((self.home/'config/hwatch/profiles/tailnet.json').read_text())
+        self.assertEqual(config['type'],'tailscale')
+        self.assertTrue(config['includeOffline'])
+        self.assertNotIn('context',config)
+        self.assertIn('tag:devbox',self.call('profile','list').stdout)
+        self.assertIn('includeOffline',self.call('profile','show','tailnet').stdout)
+        self.call('run','--once')
+        ssh_config=self.home/'.ssh/config'
+        ssh_config.write_text('Include "'+str(self.home/'.ssh/hwatch.conf')+'"\nHost *\n')
+        before=ssh_config.read_bytes()
+        result=self.call('doctor')
+        self.assertIn('OK: tailscale',result.stdout)
+        self.assertNotIn('kubectl',result.stdout)
+        self.assertNotIn('virtctl',result.stdout)
+        self.assertEqual(ssh_config.read_bytes(),before)
+        calls=[json.loads(line) for line in (self.home/'calls').read_text().splitlines()]
+        self.assertFalse(any(call[0] in ['kubectl','virtctl'] for call in calls))
+
+    def test_tailscale_tag_identity_offline_and_removal_lifecycle(self):
+        self.tailscale_profile()  # omitted includeOffline defaults to true
+        self.tailnet(online=False)
+        self.call('run','--once')
+        ssh=self.home/'.ssh/hwatch.conf'
+        self.assertIn('100.64.0.20',ssh.read_text())
+        self.assertNotIn('ProxyCommand',ssh.read_text())
+        self.assertEqual(len(self.machines()),1)  # offline first add is pending
+        data=self.tailnet()
+        self.call('run','--once')
+        self.assertEqual(len(self.machines()),2)  # excludes self and nonmatching tag
+        alias=next(m['target'] for m in self.machines() if m['id']!='unrelated')
+        old_id=next(m['id'] for m in self.machines() if m['target']==alias)
+        before=ssh.stat().st_mtime_ns
+        self.call('run','--once')
+        self.assertEqual(ssh.stat().st_mtime_ns,before)
+        # A new public key, hostname, and address must not replace the Herdr identity.
+        peer=data['Peer'].pop('nodekey:rotating')
+        peer.update(HostName='renamed',TailscaleIPs=['100.64.0.25'])
+        data['Peer']['nodekey:new-key']=peer
+        # Duplicate display names must still produce distinct aliases; IPv6-only is usable.
+        data['Peer']['nodekey:another']=dict(peer,ID='nStable456',TailscaleIPs=['fd7a:115c:a1e0::26'])
+        (self.home/'tailscale.json').write_text(json.dumps(data))
+        self.call('run','--once')
+        self.assertEqual(len(self.machines()),3)
+        self.assertIn('Host '+alias+'\n',ssh.read_text())
+        self.assertIn('100.64.0.25',ssh.read_text())
+        self.assertIn('fd7a:115c:a1e0::26',ssh.read_text())
+        ipv6_alias=next(m['target'] for m in self.machines() if m['id']!='unrelated' and m['target']!=alias)
+        parsed=subprocess.run(['ssh','-G','-F',str(ssh),ipv6_alias],env=self.env,text=True,capture_output=True,check=True)
+        self.assertIn('hostname fd7a:115c:a1e0::26',parsed.stdout)
+        self.assertNotIn('proxycommand ',parsed.stdout)
+        self.assertEqual(next(m['id'] for m in self.machines() if m['target']==alias),old_id)
+        for peer in data['Peer'].values(): peer['Online']=False
+        (self.home/'tailscale.json').write_text(json.dumps(data))
+        self.call('run','--once')
+        self.assertEqual(len(self.machines()),3)
+        self.tailscale_profile(offline=False)
+        self.call('run','--once')
+        self.assertEqual(len(self.machines()),1)
+        self.assertNotIn('Host '+alias+'\n',ssh.read_text())
+        self.tailscale_profile()
+        self.tailnet()
+        self.call('run','--once')
+        self.tailnet(tagged=False)
+        self.call('run','--once')
+        self.assertEqual(len(self.machines()),1)
+        self.tailnet()
+        self.call('run','--once')
+        (self.home/'tailscale.json').write_text(json.dumps(dict(BackendState='Running',Peer={})))
+        self.call('run','--once')
+        self.assertEqual(len(self.machines()),1)
+        self.tailnet()
+        self.call('run','--once')
+        self.call('profile','remove','tailnet',input='y\n')
+        self.assertEqual(len(self.machines()),1)
+        self.assertNotIn('100.64.0.20',ssh.read_text())
+
+    def test_tailscale_failure_preserves_entries_while_kubevirt_continues(self):
+        self.profile()
+        self.tailscale_profile()
+        self.tailnet()
+        self.call('run','--once')
+        self.assertEqual(len(self.machines()),3)
+        self.cluster(empty=True)
+        (self.home/'tailscale-fails').touch()
+        self.assertNotEqual(self.call('run','--once',ok=False).returncode,0)
+        self.assertEqual(len(self.machines()),2)
+        ssh=self.home/'.ssh/hwatch.conf'
+        before=ssh.read_bytes()
+        (self.home/'tailscale-fails').unlink()
+        missing_id=self.tailnet()
+        del missing_id['Peer']['nodekey:rotating']['ID']
+        invalid_ip=self.tailnet()
+        invalid_ip['Peer']['nodekey:rotating']['TailscaleIPs']=['100.64.0.20\nProxyCommand bad']
+        for bad in ['not JSON',json.dumps(dict(BackendState='Stopped',Peer={})),json.dumps(dict(BackendState='Running')),json.dumps(missing_id),json.dumps(invalid_ip)]:
+            (self.home/'tailscale.json').write_text(bad)
+            self.assertNotEqual(self.call('run','--once',ok=False).returncode,0)
+            self.assertEqual(ssh.read_bytes(),before)
+            self.assertEqual(len(self.machines()),2)
+        self.tailnet()
+        self.call('run','--once')
+        self.assertEqual(len(self.machines()),2)
 
     def test_single_runner_and_poll_validation(self):
         self.profile()
