@@ -1,0 +1,108 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            matchbox_sha256: a74a263b450421b007ba59fe640a8d3b2378a82b071aa49291984a093b486279
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            matchbox_sha256: 6d99da1089abf3d169788e4df4c47b4d37ec59c30dff76933ca82ad8e8f25050
+          - platform: macos-x64
+            runner: macos-15-intel
+            matchbox_sha256: 8f3bf7673ca5e3677b79e10ec220c1d3a9cf1b6ece0a96d2212430b1332c11bd
+          - platform: macos-arm64
+            runner: macos-15
+            matchbox_sha256: 1012de4d62787cd92bb47397f677a94cf794d958b8ad5b45940e610ccb342c9c
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned MatchBox v0.12.0
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          EXPECTED_SHA256: ${{ matrix.matchbox_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/matchbox"
+          file="$RUNNER_TEMP/matchbox/matchbox"
+          curl --fail --silent --show-error --location --proto '=https' \
+            "https://github.com/ortus-boxlang/matchbox/releases/download/v0.12.0/matchbox-$PLATFORM" -o "$file"
+          actual=$(shasum -a 256 "$file" | awk '{print $1}')
+          test "$actual" = "$EXPECTED_SHA256"
+          chmod +x "$file"
+          "$file" --version
+          echo "$RUNNER_TEMP/matchbox" >> "$GITHUB_PATH"
+      - name: Test CLI and installer
+        run: |
+          python3 tests/acceptance.py
+          python3 tests/install.py
+          sh -n install.sh
+      - name: Verify source-free bytecode and native executable
+        run: python3 tests/source_free.py
+      - name: Build distributable binary
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          matchbox --target native --output "dist/hwatch-$PLATFORM" src/main.bxs
+          "./dist/hwatch-$PLATFORM" --help
+          HWATCH_BIN="$PWD/dist/hwatch-$PLATFORM" python3 tests/acceptance.py
+          matchbox --version > "dist/build-info-$PLATFORM.txt"
+          printf '\nTarget: %s\nSource commit: %s\n' "$PLATFORM" "$GITHUB_SHA" >> "dist/build-info-$PLATFORM.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hwatch-${{ matrix.platform }}
+          path: |
+            dist/hwatch-${{ matrix.platform }}
+            dist/build-info-${{ matrix.platform }}.txt
+          if-no-files-found: error
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hwatch-*
+          merge-multiple: true
+          path: release
+      - name: Create checksums and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum hwatch-* > SHA256SUMS
+          prerelease=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$RELEASE_TAG" hwatch-* build-info-*.txt SHA256SUMS \
+            --verify-tag --title "hwatch $RELEASE_TAG" --generate-notes "${prerelease[@]}"

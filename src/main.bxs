@@ -1,0 +1,482 @@
+// hwatch: a thin KubeVirt -> OpenSSH -> Herdr reconciler.
+function paths() {
+    var home = getSystemSetting("HOME");
+    var configHome = getSystemSetting("XDG_CONFIG_HOME", "");
+    var stateHome = getSystemSetting("XDG_STATE_HOME", "");
+    if (!len(configHome) || left(configHome,1) != "/") configHome = home & "/.config";
+    if (!len(stateHome) || left(stateHome,1) != "/") stateHome = home & "/.local/state";
+    return {
+        home: home,
+        profiles: configHome & "/hwatch/profiles",
+        state: stateHome & "/hwatch",
+        ssh: home & "/.ssh/hwatch.conf",
+        sshConfig: home & "/.ssh/config"
+    };
+}
+function fail(message) { throw(message); }
+function exec(name, args, timeout=30) {
+    var r = systemExecute(name=name, arguments=args, timeout=timeout, terminateOnTimeout=true);
+    if (r.timeout || r.exitCode != 0) {
+        fail(name & " failed: " & trim(r.error & " " & r.output));
+    }
+    return r.output;
+}
+function mkdir(path) {
+    if (!directoryExists(path)) {
+        directoryCreate(path, true);
+        fileSetAccessMode(path, "700");
+    }
+}
+function atomicWrite(path, text) {
+    if (fileExists(path) && fileRead(path) == text) return;
+    mkdir(getDirectoryFromPath(path));
+    var temp = path & "." & createUUID() & ".tmp";
+    try {
+        fileWrite(temp, text);
+        fileSetAccessMode(temp, "600");
+        // Same-filesystem rename, including replacement on the supported Unix hosts.
+        fileMove(temp, path);
+    } finally {
+        if (fileExists(temp)) fileDelete(temp);
+    }
+}
+function validName(name) {
+    if (!reFind("^[a-z0-9][a-z0-9-]{0,39}$", name)) fail("Profile names must be 1-40 lowercase letters, digits, or hyphens.");
+    return name;
+}
+function profilePath(p, name) { return p.profiles & "/" & validName(name) & ".json"; }
+function safeText(value, field) {
+    if (!isSimpleValue(value) || reFind("[\r\n\x00]", value)) fail("Invalid " & field & ": expected a single line.");
+    return value & "";
+}
+function validateProfile(config) {
+    if (!isStruct(config)) fail("Profile must be a JSON object.");
+    for (var field in ["context", "namespace", "selector", "user"]) {
+        if (!structKeyExists(config, field) || !len(trim(safeText(config[field], field)))) fail("Profile requires " & field & ".");
+    }
+    if (!reFind("^[a-z_][a-z0-9_-]*[$]?$", config.user)) fail("Invalid SSH user.");
+    if (config.namespace != "*" && !reFind("^[a-z0-9][a-z0-9-]*$", config.namespace)) fail("Namespace must be a Kubernetes namespace or *.");
+    if (!structKeyExists(config, "includeStopped")) config.includeStopped = true;
+    if (serializeJSON(config.includeStopped) != "true" && serializeJSON(config.includeStopped) != "false") fail("includeStopped must be a JSON boolean: true or false.");
+    if (!structKeyExists(config, "port")) config.port = 22;
+    if (!isNumeric(config.port)) fail("SSH port must be 1-65535.");
+    config.port = val(config.port);
+    if (config.port < 1 || config.port > 65535 || int(config.port) != config.port) fail("SSH port must be 1-65535.");
+    if (!structKeyExists(config, "identityFile")) config.identityFile = "";
+    safeText(config.identityFile, "identityFile");
+    return config;
+}
+function loadProfiles(p) {
+    var result = {};
+    if (!directoryExists(p.profiles)) return result;
+    var files = directoryList(p.profiles, false, "path", "*.json");
+    arraySort(files, "text");
+    for (var path in files) {
+        var name = reReplace(getFileFromPath(path), "\.json$", "");
+        validName(name);
+        result[name] = validateProfile(deserializeJSON(fileRead(path)));
+    }
+    return result;
+}
+function loadState(p) {
+    var path = p.state & "/state.json";
+    if (!fileExists(path)) return {version: 1, entries: {}};
+    var s = deserializeJSON(fileRead(path));
+    if (!isStruct(s) || !structKeyExists(s,"version") || s.version != 1 || !structKeyExists(s,"entries") || !isStruct(s.entries)) fail("Invalid hwatch state; refusing to reconcile.");
+    for (var alias in s.entries) {
+        var entry = s.entries[alias];
+        for (var field in ["profile", "ssh", "id", "running", "addAttempted"]) {
+            if (!structKeyExists(entry,field)) fail("Incomplete hwatch state; refusing to reconcile.");
+        }
+    }
+    return s;
+}
+function saveState(p, state) { atomicWrite(p.state & "/state.json", serializeJSON(state)); }
+function profileJSON(config) {
+    var lines = [];
+    for (var field in ["context","namespace","selector","user","identityFile","port","includeStopped"]) {
+        arrayAppend(lines,"  " & serializeJSON(field) & ": " & serializeJSON(config[field]));
+    }
+    return "{" & chr(10) & arrayToList(lines,"," & chr(10)) & chr(10) & "}" & chr(10);
+}
+function acquireLock(p) {
+    mkdir(p.state);
+    var lock = p.state & "/run.lock";
+    var r = systemExecute(name="mkdir", arguments=[lock], timeout=5, terminateOnTimeout=true);
+    if (r.exitCode != 0) fail("Another hwatch may be running. Lock: " & lock & ". Run hwatch doctor for recovery instructions.");
+    try {
+        var pid = trim(exec("sh", ["-c", "echo $PPID"]));
+        fileWrite(lock & "/owner", pid);
+        return lock;
+    } catch (any e) {
+        directoryDelete(lock,true);
+        rethrow;
+    }
+}
+function releaseLock(lock) { directoryDelete(lock, true); }
+function shellQuote(value, sshTokens=true) {
+    // OpenSSH expands percent tokens before passing ProxyCommand to a shell.
+    var text = sshTokens ? replace(value, "%", "%%", "all") : value;
+    return "'" & replace(text, "'", "'" & chr(34) & "'" & chr(34) & "'", "all") & "'";
+}
+function sshQuote(value) {
+    var text = replace(value, "%", "%%", "all");
+    text = replace(text, chr(92), chr(92) & chr(92), "all");
+    text = replace(text, chr(34), chr(92) & chr(34), "all");
+    return chr(34) & text & chr(34);
+}
+function sshBlock(alias, config, namespace, vm) {
+    var nl = chr(10);
+    var text = "Host " & alias & nl & "    HostName " & alias & nl & "    User " & config.user & nl & "    Port " & config.port & nl;
+    if (len(config.identityFile)) text &= "    IdentityFile " & sshQuote(config.identityFile) & nl & "    IdentitiesOnly yes" & nl;
+    // ProxyCommand preserves its shell syntax; quote every dynamic argument.
+    var command = "virtctl --context " & shellQuote(config.context) & " --namespace " & shellQuote(namespace) & " port-forward --stdio=true " & shellQuote("vm/" & vm) & " %p";
+    text &= "    ProxyCommand " & command & nl;
+    return text & nl;
+}
+function checkSSHOwnership(p) {
+    var marker = "## Generated by hwatch. Do not edit.";
+    if (fileExists(p.ssh) && left(fileRead(p.ssh),len(marker)) != marker) fail("Refusing to overwrite a non-hwatch SSH file: " & p.ssh);
+}
+function writeSSH(p, state) {
+    checkSSHOwnership(p);
+    var text = "## Generated by hwatch. Do not edit." & chr(10) & chr(10);
+    var aliases = structKeyArray(state.entries);
+    arraySort(aliases, "text");
+    for (var alias in aliases) text &= state.entries[alias].ssh;
+    text &= "Host *" & chr(10);
+    atomicWrite(p.ssh, text);
+}
+function kubeArgs(config, kind) {
+    var args = ["--context", config.context, "get", kind];
+    if (config.namespace == "*") arrayAppend(args, "--all-namespaces");
+    else { arrayAppend(args,"--namespace"); arrayAppend(args,config.namespace); }
+    if (kind == "vm") { arrayAppend(args,"--selector"); arrayAppend(args,config.selector); }
+    arrayAppend(args,"--output=json"); arrayAppend(args,"--request-timeout=20s");
+    return args;
+}
+function discover(name, config, old) {
+    var vms = deserializeJSON(exec("kubectl", kubeArgs(config,"vm")));
+    // VM labels need not be copied to the VirtualMachineInstance.
+    var instances = deserializeJSON(exec("kubectl", kubeArgs(config,"vmi")));
+    if (!isStruct(vms) || !structKeyExists(vms,"items") || !isArray(vms.items) || !isStruct(instances) || !structKeyExists(instances,"items") || !isArray(instances.items)) fail("Invalid Kubernetes list response.");
+    var running = {};
+    for (var instance in instances.items) {
+        if (!structKeyExists(instance,"metadata") || !structKeyExists(instance,"status")) fail("Invalid VMI response.");
+        if (structKeyExists(instance.status,"phase") && instance.status.phase == "Running" && structKeyExists(instance.metadata,"ownerReferences")) {
+            for (var owner in instance.metadata.ownerReferences) {
+                if (owner.kind == "VirtualMachine") running[owner.uid] = true;
+            }
+        }
+    }
+    var entries = {};
+    for (var vm in vms.items) {
+        var meta = vm.metadata;
+        if (!reFind("^[a-z0-9][a-z0-9.-]*$",meta.name) || !reFind("^[a-z0-9][a-z0-9-]*$",meta.namespace)) fail("Invalid VM name or namespace.");
+        var active = structKeyExists(running,meta.uid);
+        if (!active && !config.includeStopped) continue;
+        // Dots separate the profile and namespace (neither allows dots).
+        var alias = "hw-" & name & "." & meta.namespace & "." & meta.name;
+        var entry = {profile: name, ssh: sshBlock(alias, config, meta.namespace, meta.name), id: "", running: active, addAttempted: false};
+        if (structKeyExists(old,alias)) {
+            entry.id = old[alias].id;
+            entry.addAttempted = old[alias].addAttempted;
+        }
+        entries[alias] = entry;
+    }
+    return entries;
+}
+function machineList() {
+    var machines = deserializeJSON(exec("herdr",["machine","list","--json"]));
+    if (!isArray(machines)) fail("Invalid Herdr machine list.");
+    for (var machine in machines) {
+        if (!structKeyExists(machine,"id") || !structKeyExists(machine,"target")) fail("Invalid Herdr machine record.");
+    }
+    return machines;
+}
+function removeOwned(alias, entry, machines) {
+    if (!len(entry.id)) {
+        // Recover an interrupted add only after a recorded, exclusive add attempt.
+        if (entry.addAttempted) {
+            for (var machine in machines) {
+                if (machine.target == alias) entry.id = machine.id;
+            }
+        }
+    }
+    if (!len(entry.id)) return;
+    for (var machine in machines) {
+        if (machine.id == entry.id) {
+            if (machine.target != alias) fail("Herdr ID no longer targets " & alias & "; refusing removal.");
+            exec("herdr",["machine","remove",entry.id]);
+            println("Removed " & alias);
+        }
+    }
+}
+function register(p, state, alias, entry, machines) {
+    for (var machine in machines) {
+        if (machine.id == entry.id && machine.target == alias) return;
+    }
+    entry.id = "";
+    for (var machine in machines) {
+        if (machine.target == alias) {
+            if (!entry.addAttempted) fail("SSH target " & alias & " already exists in Herdr but is not owned by hwatch.");
+            entry.id = machine.id;
+            saveState(p,state);
+            return;
+        }
+    }
+    if (!entry.running) { println("Pending (stopped): " & alias); return; }
+    entry.addAttempted = true;
+    saveState(p,state);
+    try {
+        // stdin is closed by systemExecute; do not approve authentication or installation.
+        exec("herdr",["machine","add",alias,"--label",alias,"--remote-session","default"],60);
+        var updated = machineList();
+        for (var machine in updated) {
+            if (machine.target == alias && machine.session == "default") {
+                entry.id = machine.id;
+                saveState(p,state);
+                println("Added " & alias);
+                return;
+            }
+        }
+        fail("Herdr did not return a saved machine for " & alias);
+    } catch (any e) {
+        fail("Setup needed for " & alias & ": " & e.message & chr(10) & "Run manually: herdr machine add " & alias & " --label " & alias & " --remote-session default");
+    }
+}
+function reconcile(p, configs, state) {
+    checkSSHOwnership(p);
+    var ok = true;
+    var desired = {};
+    for (var name in configs) {
+        try {
+            var found = discover(name,configs[name],state.entries);
+            for (var alias in found) desired[alias] = found[alias];
+        } catch (any e) {
+            println("Profile " & name & ": " & e.message & " Keeping previous entries.");
+            ok = false;
+            for (var alias in state.entries) {
+                if (state.entries[alias].profile == name) {
+                    desired[alias] = duplicate(state.entries[alias]);
+                    // Do not attempt registration with stale running information.
+                    desired[alias].running = false;
+                }
+            }
+        }
+    }
+    var machines = machineList();
+    // Remove stale Herdr entries first. Retain failed removals for the next pass.
+    for (var alias in structKeyArray(state.entries)) {
+        if (!structKeyExists(desired,alias)) {
+            try { removeOwned(alias,state.entries[alias],machines); }
+            catch (any e) { println(e.message); desired[alias] = state.entries[alias]; ok = false; }
+        }
+    }
+    state.entries = desired;
+    saveState(p,state);
+    writeSSH(p,state);
+    for (var alias in structKeyArray(state.entries)) {
+        try { register(p,state,alias,state.entries[alias],machines); }
+        catch (any e) { println(e.message); ok = false; }
+    }
+    return ok;
+}
+function prompt(label, fallback="") {
+    var value = trim(cliRead(label & (len(fallback) ? " [" & fallback & "]" : "") & ": "));
+    return len(value) ? value : fallback;
+}
+function yes(label, fallback=true) {
+    var answer = lCase(prompt(label & (fallback ? " [Y/n]" : " [y/N]")));
+    if (!len(answer)) return fallback;
+    if (answer == "y" || answer == "yes") return true;
+    if (answer == "n" || answer == "no") return false;
+    fail("Expected yes or no; nothing saved.");
+}
+function newProfile(p, name) {
+    var path = profilePath(p,name);
+    if (fileExists(path)) fail("Profile already exists: " & name);
+    println("Available Kubernetes contexts:");
+    println(exec("kubectl",["config","get-contexts","--output=name"]));
+    var config = {};
+    config.context = prompt("Kubernetes context");
+    config.namespace = prompt("Namespace (* for all)","*");
+    config.selector = prompt("VM label selector","hwatch=enabled");
+    config.user = prompt("SSH user",getSystemSetting("USER",""));
+    config.identityFile = prompt("SSH identity file (blank for SSH defaults)");
+    config.port = prompt("SSH port","22");
+    config.includeStopped = yes("Keep stopped VMs in SSH and Herdr?",true);
+    validateProfile(config);
+    // Validate both resource permissions and selector before saving.
+    discover(name,config,{});
+    println(profileJSON(config));
+    if (!yes("Save profile?",true)) { println("Cancelled; nothing saved."); return; }
+    atomicWrite(path,profileJSON(config));
+    println("Saved " & path & ". Run hwatch doctor, then hwatch run.");
+}
+function sshSettings(text) {
+    var result = {};
+    for (var line in listToArray(text,chr(10))) {
+        var split = find(" ",line);
+        if (split > 0) result[left(line,split-1)] = mid(line,split+1,len(line));
+    }
+    return result;
+}
+function doctor(p) {
+    var ok = true;
+    for (var tool in ["kubectl","virtctl","herdr","ssh","mkdir","sh"]) {
+        try { exec("sh",["-c",'command -v "$1"', "hwatch", tool]); println("OK: " & tool); }
+        catch (any e) { println("MISSING: " & tool & " — install it and put it on PATH."); ok = false; }
+    }
+    try {
+        var configs = loadProfiles(p);
+        if (structIsEmpty(configs)) { println("No profiles. Run hwatch profile new <name>."); ok = false; }
+        for (var name in configs) {
+            try { discover(name,configs[name],{}); println("OK: profile " & name & " cluster access"); }
+            catch (any e) { println("UNAVAILABLE: " & name & ": " & e.message); ok = false; }
+        }
+    } catch (any e) { println("INVALID profile: " & e.message); ok = false; }
+    try {
+        machineList();
+        var addHelp = exec("herdr",["machine","add","--help"]);
+        if (!find("--remote-session",addHelp) || !find("--label",addHelp)) fail("Herdr is missing required machine-add options; update Herdr.");
+        exec("herdr",["machine","remove","--help"]);
+        println("OK: Herdr JSON machine catalog and machine commands");
+    } catch (any e) { println("Herdr: " & e.message); ok = false; }
+    var included = false;
+    if (fileExists(p.sshConfig) && fileExists(p.ssh)) {
+        try {
+            var r = systemExecute(name="ssh", arguments=["-G","-vv","-F",p.sshConfig,"hwatch-doctor.invalid"], timeout=10, terminateOnTimeout=true);
+            included = r.exitCode == 0 && find(p.ssh,r.error) > 0;
+            if (r.exitCode != 0) println("SSH config error: " & r.error);
+        } catch (any e) { println("SSH check: " & e.message); }
+    }
+    if (included) {
+        println("OK: SSH reads " & p.ssh);
+        try {
+            var state = loadState(p);
+            for (var alias in state.entries) {
+                var expected = sshSettings(exec("ssh",["-G","-F",p.ssh,alias]));
+                var actual = sshSettings(exec("ssh",["-G","-F",p.sshConfig,alias]));
+                for (var field in ["hostname","user","port","proxycommand"]) {
+                    if (!structKeyExists(actual,field) || !structKeyExists(expected,field) || actual[field] != expected[field]) fail("SSH setting " & field & " for " & alias & " is overridden. Move the hwatch Include before other Host/Match blocks.");
+                }
+            }
+            println("OK: managed SSH host settings are effective");
+        } catch (any e) { println(e.message); ok = false; }
+    }
+    else {
+        ok = false;
+        println("SSH include not verified. Add this near the top of " & p.sshConfig & ", before Host or Match blocks:");
+        println("    Include " & sshQuote(p.ssh));
+        println("    Host *");
+        println("If the generated file does not exist yet, run hwatch run --once and check again.");
+    }
+    if (fileExists(p.ssh)) {
+        try { checkSSHOwnership(p); exec("ssh",["-G","-F",p.ssh,"hwatch-doctor.invalid"]); println("OK: generated SSH syntax"); }
+        catch (any e) { println(e.message); ok = false; }
+    }
+    var lock = p.state & "/run.lock";
+    if (directoryExists(lock)) {
+        ok = false;
+        var owner = fileExists(lock & "/owner") ? trim(fileRead(lock & "/owner")) : "unknown";
+        println("Lock present: " & lock & " (PID " & owner & ").");
+        println("If no hwatch process is running, remove the stale lock: rm -r " & shellQuote(lock,false));
+    }
+    println("Doctor made no changes. VMs need SSH access and a compatible Herdr server; hwatch never approves installation or host keys.");
+    return ok;
+}
+function help() {
+    println("hwatch — keep KubeVirt VMs in SSH and Herdr");
+    println("Usage: hwatch <command> [args]");
+    println("  profile list                 List profiles");
+    println("  profile new <name>           Interactive setup");
+    println("  profile show <name>          Display profile JSON");
+    println("  profile where <name>         Print profile path");
+    println("  profile remove <name>        Remove profile and owned connections");
+    println("  run [--once] [--poll-seconds 120]  Reconcile immediately, then poll");
+    println("  doctor                       Read-only setup diagnostics");
+    println("  --help                       Show this help");
+}
+function main() {
+    var p = paths();
+    var args = cliGetArgs();
+    var words = args.positionals;
+    var options = args.options;
+    if (structKeyExists(options,"help") || structKeyExists(options,"h") || !arrayLen(words)) { help(); return 0; }
+    for (var option in options) {
+        if (option != "once" && option != "poll-seconds") fail("Unknown option: --" & option);
+        if (words[1] != "run") fail("--" & option & " is only supported with run.");
+    }
+    if (words[1] == "doctor" && arrayLen(words) == 1) return doctor(p) ? 0 : 1;
+    if (words[1] == "profile") {
+        if (arrayLen(words) == 2 && words[2] == "list") {
+            var configs = loadProfiles(p);
+            var names = structKeyArray(configs);
+            arraySort(names,"text");
+            for (var name in names) println(name & "  " & configs[name].context & "  " & configs[name].namespace & "  " & configs[name].selector);
+            if (!arrayLen(names)) println("No profiles. Run hwatch profile new <name>.");
+            return 0;
+        }
+        if (arrayLen(words) != 3) fail("Usage: hwatch profile <new|show|where|remove> <name>");
+        var path = profilePath(p,words[3]);
+        if (words[2] == "new") { newProfile(p,words[3]); return 0; }
+        if (!fileExists(path)) fail("Profile not found: " & words[3]);
+        if (words[2] == "where") { println(path); return 0; }
+        if (words[2] == "show") { println(profileJSON(validateProfile(deserializeJSON(fileRead(path))))); return 0; }
+        if (words[2] == "remove") {
+            if (!yes("Remove " & words[3] & " and its managed SSH/Herdr entries?",false)) { println("Cancelled."); return 0; }
+            var lock = acquireLock(p);
+            try {
+                checkSSHOwnership(p);
+                var state = loadState(p);
+                var machines = machineList();
+                for (var alias in structKeyArray(state.entries)) {
+                    if (state.entries[alias].profile == words[3]) {
+                        removeOwned(alias,state.entries[alias],machines);
+                        structDelete(state.entries,alias);
+                        saveState(p,state);
+                    }
+                }
+                writeSSH(p,state);
+                fileDelete(path);
+                println("Removed profile " & words[3]);
+            } finally { releaseLock(lock); }
+            return 0;
+        }
+        fail("Unknown profile command: " & words[2]);
+    }
+    if (words[1] == "run") {
+        var poll = 120;
+        if (structKeyExists(options,"poll-seconds")) {
+            poll = options["poll-seconds"];
+            // cliGetArgs attaches values only with '='. Support the promised space form too.
+            if (serializeJSON(poll) == "true") {
+                if (arrayLen(words) != 2) fail("--poll-seconds requires a positive integer.");
+                poll = words[2];
+            } else if (arrayLen(words) != 1) fail("Unexpected run arguments.");
+        } else if (arrayLen(words) != 1) fail("Unexpected run arguments.");
+        if (!isNumeric(poll)) fail("--poll-seconds must be a positive integer.");
+        poll = val(poll);
+        if (poll < 1 || int(poll) != poll) fail("--poll-seconds must be a positive integer.");
+        var lock = acquireLock(p);
+        try {
+            var state = loadState(p);
+            while (true) {
+                var configs = loadProfiles(p);
+                if (structIsEmpty(configs) && structIsEmpty(state.entries)) fail("No profiles. Run hwatch profile new <name>.");
+                var ok = false;
+                try { ok = reconcile(p,configs,state); }
+                catch (any e) { println("Reconciliation failed: " & e.message); }
+                if (structKeyExists(options,"once") && options.once) return ok ? 0 : 1;
+                println("Next poll in " & poll & " seconds. Ctrl+C to stop.");
+                sleep(poll * 1000);
+            }
+        } finally { releaseLock(lock); }
+    }
+    fail("Unknown command. Run hwatch --help.");
+}
+var status = 0;
+try { status = main(); }
+catch (any e) { println("hwatch: " & e.message); status = 1; }
+if (status != 0) cliExit(status);
