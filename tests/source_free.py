@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build staged copies and verify the public CLI without its source files."""
+import json
 import os
 from pathlib import Path
 import shutil
@@ -24,8 +25,16 @@ with tempfile.TemporaryDirectory(prefix='hwatch-source-free-') as directory:
     native=stage/'hwatch'
     env=dict(os.environ, BOXLANG_HOME=str(stage/'empty-boxlang-home'))
     run([MATCHBOX,str(entry),'--help'],env=env,cwd=stage)
-    run([MATCHBOX,'--build','--output',str(bytecode),str(entry)],env=env,cwd=stage)
-    run([MATCHBOX,'--target','native','--output',str(native),str(entry)],env=env,cwd=stage)
+    # A fixed build timestamp proves identity is embedded, not read at runtime.
+    env['SOURCE_DATE_EPOCH']='1700000000'
+    env['MATCHBOX']=MATCHBOX
+    info=dict(version=subprocess.check_output(['git','describe','--tags','--always','--dirty'],cwd=ROOT,text=True).strip(),
+              commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
+              date='2023-11-14T22:13:20Z')
+    env['HWATCH_EXPECT_BUILD_INFO']=json.dumps(info)
+    for target,output in [('bytecode',bytecode),('native',native)]:
+        run(['python3',str(ROOT/'tools/build.py'),'--target',target,'--output',str(output),
+             '--source',str(entry)],env=env,cwd=stage)
     entry.unlink()
     app.rmdir()
     for index,command in enumerate([[MATCHBOX,str(bytecode)],[str(native)]]):
@@ -43,7 +52,7 @@ with tempfile.TemporaryDirectory(prefix='hwatch-source-free-') as directory:
             # Exercise distribution with no Java, Cargo, SDK, or MatchBox on PATH.
             tools=stage/'tools'
             tools.mkdir()
-            for tool in ['sh','mkdir','ssh','python3']:
+            for tool in ['sh','mkdir','rmdir','rm','ps','ssh','python3']:
                 (tools/tool).symlink_to(shutil.which(tool))
             env['PATH']=str(tools)
         run(['python3',str(ROOT/'tests/acceptance.py')],env=env,cwd=stage)

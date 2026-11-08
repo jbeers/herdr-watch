@@ -33,6 +33,8 @@ jobs:
             matchbox_sha256: 1012de4d62787cd92bb47397f677a94cf794d958b8ad5b45940e610ccb342c9c
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -66,10 +68,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          matchbox --target native --output "dist/hwatch-$PLATFORM" src/main.bxs
+          python3 tools/build.py --output "dist/hwatch-$PLATFORM"
+          "./dist/hwatch-$PLATFORM" --version
           "./dist/hwatch-$PLATFORM" --help
           HWATCH_BIN="$PWD/dist/hwatch-$PLATFORM" python3 tests/acceptance.py
-          matchbox --version > "dist/build-info-$PLATFORM.txt"
+          "./dist/hwatch-$PLATFORM" --version > "dist/build-info-$PLATFORM.txt"
+          matchbox --version >> "dist/build-info-$PLATFORM.txt"
           printf '\nTarget: %s\nSource commit: %s\n' "$PLATFORM" "$GITHUB_SHA" >> "dist/build-info-$PLATFORM.txt"
       - uses: actions/upload-artifact@v4
         with:

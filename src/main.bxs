@@ -1,4 +1,6 @@
 // hwatch: thin KubeVirt/Tailscale -> OpenSSH -> Herdr reconciliation.
+// tools/build.py replaces this fallback in a temporary source copy.
+function buildInfo() { return {version: "dev", commit: "unknown", date: "unbuilt"}; }
 function paths() {
     var home = getSystemSetting("HOME");
     var configHome = getSystemSetting("XDG_CONFIG_HOME", "");
@@ -109,16 +111,36 @@ function profileJSON(config) {
 function acquireLock(p) {
     mkdir(p.state);
     var lock = p.state & "/run.lock";
-    var r = systemExecute(name="mkdir", arguments=[lock], timeout=5, terminateOnTimeout=true);
-    if (r.exitCode != 0) fail("Another hwatch may be running. Lock: " & lock & ". Run hwatch doctor for recovery instructions.");
-    try {
-        var pid = trim(exec("sh", ["-c", "echo $PPID"]));
-        fileWrite(lock & "/owner", pid);
-        return lock;
-    } catch (any e) {
-        directoryDelete(lock,true);
-        rethrow;
-    }
+    // Serialize inspection/removal/creation: two starters must never both reclaim
+    // the same dead owner's lock. Ignore ordinary signals only in this short
+    // shell transaction, so Ctrl+C cannot strand the acquisition guard.
+    var script = "
+trap '' INT TERM HUP
+umask 077
+lock=$1
+guard=$lock.acquire
+mkdir ""$guard"" 2>/dev/null || exit 1
+trap 'rmdir ""$guard""' 0
+if [ -d ""$lock"" ]; then
+    [ -f ""$lock/owner"" ] || exit 1
+    owner=
+    IFS= read -r owner < ""$lock/owner""
+    case $owner in ''|*[!0-9]*|0|1) exit 1 ;; esac
+    # kill -0 cannot distinguish a missing process from permission denial.
+    # ps exit 1 means no match; any other error must fail closed.
+    ps -p ""$owner"" -o pid= >/dev/null 2>&1
+    status=$?
+    [ ""$status"" -eq 1 ] || exit 1
+    rm ""$lock/owner"" && rmdir ""$lock"" || exit 1
+    printf 'Recovered interrupted hwatch lock (PID %s).\n' ""$owner""
+fi
+mkdir ""$lock"" || exit 1
+printf '%s\n' ""$PPID"" > ""$lock/owner"" || exit 1
+";
+    var r = systemExecute(name="sh", arguments=["-c",script,"hwatch-lock",lock], timeout=5, terminateOnTimeout=true);
+    if (r.timeout || r.exitCode != 0) fail("Another hwatch may be running. Lock: " & lock & ". Run hwatch doctor for recovery instructions.");
+    if (len(trim(r.output))) println(trim(r.output));
+    return lock;
 }
 function releaseLock(lock) { directoryDelete(lock, true); }
 function shellQuote(value, sshTokens=true) {
@@ -431,7 +453,7 @@ function doctor(p) {
     var configs = {};
     try { configs = loadProfiles(p); }
     catch (any e) { println("INVALID profile: " & e.message); ok = false; }
-    var tools = {herdr: true, ssh: true, mkdir: true, sh: true};
+    var tools = {herdr: true, ssh: true, mkdir: true, rmdir: true, rm: true, ps: true, sh: true};
     for (var name in configs) {
         if (configs[name].type == "tailscale") tools.tailscale = true;
         else { tools.kubectl = true; tools.virtctl = true; }
@@ -493,6 +515,11 @@ function doctor(p) {
         println("Lock present: " & lock & " (PID " & owner & ").");
         println("If no hwatch process is running, remove the stale lock: rm -r " & shellQuote(lock,false));
     }
+    if (directoryExists(lock & ".acquire")) {
+        ok = false;
+        println("Lock acquisition guard present: " & lock & ".acquire");
+        println("Only if no hwatch or lock-acquisition process is running, remove the guard: rmdir " & shellQuote(lock & ".acquire",false));
+    }
     println("Doctor made no changes. Machines need SSH access and a compatible Herdr server; hwatch never approves installation or host keys.");
     return ok;
 }
@@ -506,6 +533,7 @@ function help() {
     println("  profile remove <name>        Remove profile and owned connections");
     println("  run [--once] [--poll-seconds 120]  Reconcile immediately, then poll");
     println("  doctor                       Read-only setup diagnostics");
+    println("  --version                    Show version, commit, and UTC build date");
     println("  --help                       Show this help");
 }
 function main() {
@@ -513,6 +541,13 @@ function main() {
     var args = cliGetArgs();
     var words = args.positionals;
     var options = args.options;
+    if (structKeyExists(options,"version") && !arrayLen(words) && structCount(options) == 1 && serializeJSON(options.version) == "true") {
+        var info = buildInfo();
+        println("hwatch " & info.version);
+        println("Commit: " & info.commit);
+        println("Built: " & info.date);
+        return 0;
+    }
     if (structKeyExists(options,"help") || structKeyExists(options,"h") || !arrayLen(words)) { help(); return 0; }
     for (var option in options) {
         if (option != "once" && option != "poll-seconds") fail("Unknown option: --" & option);

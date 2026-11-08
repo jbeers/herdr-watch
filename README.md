@@ -25,19 +25,23 @@ curl -fsSL https://raw.githubusercontent.com/jbeers/herdr-watch/main/install.sh 
 
 ## Build and run
 
-Requires MatchBox during development/building only. CI pins MatchBox **v0.12.0**, whose Linux x86-64 source, bytecode, and native acceptance checks have also passed locally:
+Requires MatchBox, Python 3, and Git during development/building only. Build from a Git checkout so the executable can embed its identity. CI pins MatchBox **v0.12.0**, whose Linux x86-64 source, bytecode, and native acceptance checks have also passed locally:
 
 ```sh
-mkdir -p dist
-matchbox --target native --output dist/hwatch src/main.bxs
+MATCHBOX=/path/to/matchbox python3 tools/build.py --output dist/hwatch
+./dist/hwatch --version
 ./dist/hwatch --help
 ```
 
-**Put MatchBox build flags before the source filename.** Arguments after the source filename belong to the application.
+`make build` uses the same stamped build path. For bytecode, use `python3 tools/build.py --target bytecode --output dist/hwatch.bxb`.
+
+`hwatch --version` prints the version (`git describe --tags --always --dirty`), full source commit, and UTC build timestamp. Clean tagged builds print the release tag; local modifications add `-dirty`. These values are embedded, so the installed binary needs neither Git nor the source checkout. `SOURCE_DATE_EPOCH` can fix the build timestamp for reproducible build inputs. Direct source runs or raw MatchBox builds that bypass `tools/build.py` report `dev`, `unknown`, and `unbuilt` instead of claiming build provenance.
+
+**Put MatchBox build flags before the source filename** when invoking MatchBox directly. Arguments after the source filename belong to the application.
 
 For development, replace `hwatch` below with `matchbox src/main.bxs`, or run the compiled `./dist/hwatch` directly. To install, copy the executable to a user-owned directory on your `PATH`.
 
-The executable needs `herdr`, OpenSSH (`ssh`), and standard Unix `sh`/`mkdir` on `PATH`, plus the tools for your profile types:
+The executable needs `herdr`, OpenSSH (`ssh`), and standard Unix `sh`, `mkdir`, `rmdir`, `rm`, and `ps` on `PATH`, plus the tools for your profile types:
 
 - **KubeVirt:** `kubectl`, `virtctl`, a kubeconfig, and cluster access.
 - **Tailscale:** `tailscale`, with its daemon running and logged into your tailnet.
@@ -209,9 +213,11 @@ If you delete a profile file manually, the next successful reconciliation also r
 
 ### Interrupted runs and lock recovery
 
-Only one reconciler/profile-removal operation may run at once. The current lock is an atomic directory lock. Normal returns and handled errors release it, but **Ctrl+C, termination, or a crash can leave a stale lock** because this MatchBox implementation does not install signal cleanup handlers.
+Only one reconciler/profile-removal operation may run at once. Normal returns and handled errors release the directory lock. Ctrl+C, termination, or a crash can still leave the directory behind because this MatchBox runtime does not install signal cleanup handlers, but **the next run automatically recovers it if the recorded owner PID no longer exists**. This also applies to `profile remove`.
 
-Run `hwatch doctor` to see the lock path and owner PID. Confirm that no hwatch process is running before removing the lock using the command doctor prints. Never delete a live runner's lock. Automatic stale-lock recovery is deliberately not attempted, to avoid races between competing reconcilers.
+Acquisition and stale-lock recovery are serialized by a short-lived `run.lock.acquire/` guard, so competing starters cannot both reclaim a stale lock. The acquisition transaction ignores Ctrl+C/termination signals until it has finished and removed its guard. This uses standard Unix `sh`, `mkdir`, `rmdir`, `rm`, and `ps` tools. A live PID (including a reused PID), missing/invalid owner metadata, or a failed process check causes hwatch to refuse the lock rather than risk concurrent reconciliation.
+
+Run `hwatch doctor` for read-only lock/guard diagnostics and manual recovery commands. Confirm that no hwatch or lock-acquisition process is running before removing anything. Never delete a live runner's lock. A forced kill of the acquisition helper itself (SIGKILL), or a crash during acquisition, may leave a guard or incomplete owner metadata that needs manual recovery.
 
 ## Verification
 
@@ -229,7 +235,7 @@ The acceptance suite exercises the public CLI in disposable home directories. Ku
 
 The source-free check stages a copy of the source, builds bytecode and a native executable, removes the staged source, and runs the acceptance suite in both modes. The native pass uses a tool-only `PATH` without MatchBox, Java, Rust, or SDK tools.
 
-**Not yet verified locally:** end-to-end registration against a live KubeVirt VM or Tailscale peer and real Herdr remote setup; macOS/Windows; signal-clean lock cleanup. No live machines are added or removed by the tests.
+**Not yet verified locally:** end-to-end registration against a live KubeVirt VM or Tailscale peer and real Herdr remote setup; macOS/Windows. Interrupt recovery is verified on Linux; immediate signal-time lock removal is not implemented. No live machines are added or removed by the tests.
 
 ## CI and releases
 

@@ -3,8 +3,7 @@ PYTHON ?= python3
 
 .PHONY: build test check clean
 build:
-	mkdir -p dist
-	$(MATCHBOX) --target native --output dist/hwatch src/main.bxs
+	MATCHBOX="$(MATCHBOX)" $(PYTHON) tools/build.py --output dist/hwatch
 
 test:
 	MATCHBOX="$(MATCHBOX)" $(PYTHON) tests/acceptance.py

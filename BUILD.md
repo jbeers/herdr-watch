@@ -1,6 +1,40 @@
 # Local build record
 
-## Current artifact: KubeVirt + Tailscale profiles
+## Current artifact: build identity and interrupted-run lock recovery
+
+- Path/target: `dist/hwatch`, `x86_64-unknown-linux-gnu`
+- SHA-256: `88ce65fe0d2c7b03af1ee628a65784f58c713d3112c695d566c245658013546f`
+- Version: `v0.2.1-dirty`
+- Commit: `3028631e3f5f6712dd7c4c27cd5fbd5bd6141c21` (working tree modifications included, as indicated by `-dirty`)
+- Built: `2026-11-08T07:50:42Z`
+- Build: `MATCHBOX=/tmp/hwatch-matchbox-v012 python3 tools/build.py --output dist/hwatch`
+- Compiler/target and absence of modules/plugins are unchanged from the records below.
+
+All 14 acceptance scenarios passed in source, source-free bytecode/native, and the final native artifact; all 3 installer scenarios passed. Commands were the same as below, except the build now uses `tools/build.py`. `git diff --check` passed. The source-free check fixes `SOURCE_DATE_EPOCH`, asserts exact embedded version/commit/date, removes staged source, and runs the native tests with Git and build tools absent from `PATH`. Direct source runs correctly report unbuilt provenance. Updated CI builds use the stamping script and fetch tags/history; the actual GitHub Actions workflow and non-Linux platforms were not executed locally.
+
+## Previous artifact: interrupted-run lock recovery
+
+- Path: `dist/hwatch` (local build output, not committed)
+- Target: `x86_64-unknown-linux-gnu`
+- SHA-256: `831ebfa015702f08c8526206f91fba6b37b5f5d20fddec5fe1bd9a1f99d329bf`
+- Compiler: the same pinned `/tmp/hwatch-matchbox-v012` described below; no modules/plugins.
+
+Executed successfully:
+
+```sh
+MATCHBOX=/tmp/hwatch-matchbox-v012 python3 tests/acceptance.py
+MATCHBOX=/tmp/hwatch-matchbox-v012 python3 tests/source_free.py
+/tmp/hwatch-matchbox-v012 --target native --output dist/hwatch src/main.bxs
+HWATCH_BIN="$PWD/dist/hwatch" python3 tests/acceptance.py
+python3 tests/install.py
+git diff --check
+```
+
+All 13 acceptance scenarios passed in source, source-free bytecode/native, and the final native artifact; all 3 installer scenarios passed. The new regression sends SIGINT to a real runner process group in a disposable home and verifies restart without manual lock removal, plus refusal while that runner is still alive. It failed against the previous code with the reported lock error. External inventory/Herdr commands remain controlled substitutes; no live services were queried or changed.
+
+Recovery occurs on the next lock acquisition, not at signal time. A dead owner is reclaimed under a serialized acquisition guard; live/unknown owners fail closed. Unix `ps`, `rm`, and `rmdir` are now also needed for this transaction. macOS and forced interruption of the acquisition helper itself remain unverified locally. `make` was unavailable, so the direct build command above was used.
+
+## Previous build record: KubeVirt + Tailscale profiles
 
 - Path: `dist/hwatch` (local build output, not committed)
 - Target tested: `x86_64-unknown-linux-gnu`

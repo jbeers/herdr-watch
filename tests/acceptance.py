@@ -2,6 +2,7 @@
 """CLI-boundary checks; all files and external commands use a disposable home."""
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import tempfile
@@ -80,6 +81,17 @@ class Acceptance(unittest.TestCase):
 
     def machines(self):
         return json.loads((self.home/'machines.json').read_text())
+
+    def test_version_reports_build_identity_without_changing_state(self):
+        result=self.call('--version')
+        self.assertRegex(result.stdout, r'\Ahwatch \S+\nCommit: (?:[0-9a-f]{40}|unknown)\nBuilt: (?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z|unbuilt)\n\Z')
+        if 'HWATCH_EXPECT_BUILD_INFO' in self.env:
+            info=json.loads(self.env['HWATCH_EXPECT_BUILD_INFO'])
+            self.assertEqual(result.stdout,
+                             f"hwatch {info['version']}\nCommit: {info['commit']}\nBuilt: {info['date']}\n")
+        self.assertFalse((self.home/'state').exists())
+        self.assertFalse((self.home/'config').exists())
+        self.assertFalse((self.home/'calls').exists())
 
     def test_profile_wizard_and_read_only_doctor(self):
         self.assertIn('hwatch', self.call('--help').stdout)
@@ -207,6 +219,33 @@ class Acceptance(unittest.TestCase):
         self.cluster(empty=True)
         self.call('run','--once')
         self.assertEqual(self.machines(),machines)
+
+    def test_interrupted_runner_can_restart_without_manual_lock_removal(self):
+        self.profile()
+        with (self.home/'interrupt.log').open('w') as log:
+            process=subprocess.Popen(COMMAND+['run'],env=self.env,stdin=subprocess.DEVNULL,
+                                     stdout=log,stderr=log,start_new_session=True)
+            try:
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    self.assertIsNone(process.poll(),(self.home/'interrupt.log').read_text())
+                    if len(self.machines())==2: break
+                    time.sleep(0.05)
+                else: self.fail('Runner did not finish its first reconciliation')
+                # A real live owner must still block a competing invocation.
+                result=self.call('run','--once',ok=False)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('Another hwatch',result.stdout)
+                # Ctrl+C targets the foreground process group, not just its parent.
+                os.killpg(process.pid,signal.SIGINT)
+                process.wait(timeout=5)
+                self.call('run','--once')
+                self.assertFalse((self.home/'state/hwatch/run.lock').exists())
+                self.assertEqual(len(self.machines()),2)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid,signal.SIGKILL)
+                    process.wait(timeout=5)
 
     def test_loop_polls_and_reloads_profile_settings(self):
         self.profile()
