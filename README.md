@@ -23,6 +23,26 @@ curl -fsSL https://raw.githubusercontent.com/jbeers/herdr-watch/main/install.sh 
 
 **The curl command requires this repository's `main` branch and at least one published release.** Before the first release, build from source below.
 
+## Herdr plugin
+
+The [plugin in `plugin/`](plugin/README.md) exposes `hwatch.help`, `hwatch.profile`,
+`hwatch.doctor`, `hwatch.version`, `hwatch.run`, and `hwatch.watch`. Profiles and the
+watcher run in interactive terminal panes; one-shot action output is available in
+Herdr's plugin logs. Plugin and standalone execution share the existing profiles,
+ownership journal, and lock—no migration or separate configuration is needed.
+
+The plugin is prepared for **v0.3.0**; GitHub installation requires that matching
+release to be published. For local use now, build and link it:
+
+```sh
+MATCHBOX=/path/to/matchbox python3 tools/build.py --output plugin/bin/hwatch
+herdr plugin link "$PWD/plugin"
+herdr plugin action invoke hwatch.help
+```
+
+See the [plugin guide](plugin/README.md) for all actions, configuration, install,
+update, and standalone CLI instructions. Requires Herdr 0.9.2 or newer.
+
 ## Build and run
 
 Requires MatchBox, Python 3, and Git during development/building only. Build from a Git checkout so the executable can embed its identity. CI pins MatchBox **v0.12.0**, whose Linux x86-64 source, bytecode, and native acceptance checks have also passed locally:
@@ -221,12 +241,15 @@ Run `hwatch doctor` for read-only lock/guard diagnostics and manual recovery com
 
 ## Verification
 
-Python 3 is needed for development tests only. No third-party Python packages are required:
+Python 3.11+ is needed for development tests only. No third-party Python packages are required:
 
 ```sh
 MATCHBOX=/path/to/matchbox python3 tests/acceptance.py
 MATCHBOX=/path/to/matchbox python3 tests/source_free.py
 python3 tests/install.py
+MATCHBOX=/path/to/matchbox python3 tests/plugin.py
+# Optional isolated real Herdr link/action/log smoke test:
+MATCHBOX=/path/to/matchbox HERDR_TEST_BIN="$(command -v herdr)" python3 tests/plugin.py
 ```
 
 Optional Make targets provide `build`, `test`, and `check` if Make is installed.

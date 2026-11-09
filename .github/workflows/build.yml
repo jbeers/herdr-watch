@@ -54,11 +54,21 @@ jobs:
           chmod +x "$file"
           "$file" --version
           echo "$RUNNER_TEMP/matchbox" >> "$GITHUB_PATH"
+      - name: Validate plugin release pin
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, tomllib
+          manifest = tomllib.loads(pathlib.Path('plugin/herdr-plugin.toml').read_text())
+          assert 'v' + manifest['version'] == os.environ['RELEASE_TAG'], 'Release tag must match the plugin manifest version'
+          PY
       - name: Test CLI and installer
         run: |
           python3 tests/acceptance.py
           python3 tests/install.py
-          sh -n install.sh
+          for script in install.sh plugin/install.sh plugin/launch.sh; do sh -n "$script"; done
       - name: Verify source-free bytecode and native executable
         run: python3 tests/source_free.py
       - name: Build distributable binary
@@ -72,6 +82,7 @@ jobs:
           "./dist/hwatch-$PLATFORM" --version
           "./dist/hwatch-$PLATFORM" --help
           HWATCH_BIN="$PWD/dist/hwatch-$PLATFORM" python3 tests/acceptance.py
+          HWATCH_BIN="$PWD/dist/hwatch-$PLATFORM" python3 tests/plugin.py
           "./dist/hwatch-$PLATFORM" --version > "dist/build-info-$PLATFORM.txt"
           matchbox --version >> "dist/build-info-$PLATFORM.txt"
           printf '\nTarget: %s\nSource commit: %s\n' "$PLATFORM" "$GITHUB_SHA" >> "dist/build-info-$PLATFORM.txt"

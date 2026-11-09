@@ -1,3 +1,4 @@
 /dist/
+/plugin/bin/
 __pycache__/
 *.pyc

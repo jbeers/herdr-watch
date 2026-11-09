@@ -3,7 +3,7 @@
 set -eu
 
 usage() {
-    printf '%s\n' 'Usage: install.sh [--version <version>] [--bin-dir <directory>]' \
+    printf '%s\n' 'Usage: install.sh [--version <version>] [--bin-dir <directory>] [--no-path-hint]' \
         'Defaults: latest release, ${HWATCH_INSTALL_DIR:-$HOME/.local/bin}' \
         'HWATCH_VERSION may select a release such as v0.1.0.'
 }
@@ -12,11 +12,13 @@ fetch() { curl --fail --silent --show-error --location --proto '=https' --tlsv1.
 
 main() {
     version=${HWATCH_VERSION:-latest}
+    path_hint=true
     bin_dir=${HWATCH_INSTALL_DIR:-${HOME:?HOME is required}/.local/bin}
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --version) [ "$#" -ge 2 ] || fail '--version requires a value'; version=$2; shift 2 ;;
             --bin-dir) [ "$#" -ge 2 ] || fail '--bin-dir requires a value'; bin_dir=$2; shift 2 ;;
+            --no-path-hint) path_hint=false; shift ;;
             --help|-h) usage; return ;;
             *) fail "Unknown argument: $1" ;;
         esac
@@ -78,12 +80,14 @@ main() {
     chmod 755 "$staged"
     mv -f "$staged" "$bin_dir/hwatch"
     printf 'Installed hwatch %s to %s/hwatch\n' "$version" "$bin_dir"
-    case ":${PATH:-}:" in
-        *":$bin_dir:"*) ;;
-        *) printf 'Add this directory to PATH in your shell configuration: %s\n' "$bin_dir" ;;
-    esac
-    printf '%s\n' 'Next: hwatch profile new <name>, then hwatch doctor.' \
-        'Required tools: herdr, ssh, sh, mkdir. KubeVirt profiles: kubectl + virtctl. Tailscale profiles: tailscale.'
+    if [ "$path_hint" = true ]; then
+        case ":${PATH:-}:" in
+            *":$bin_dir:"*) ;;
+            *) printf 'Add this directory to PATH in your shell configuration: %s\n' "$bin_dir" ;;
+        esac
+        printf '%s\n' 'Next: hwatch profile new <name>, then hwatch doctor.'
+    fi
+    printf '%s\n' 'Required tools: herdr, ssh, sh, mkdir, rmdir, rm, ps. KubeVirt profiles: kubectl + virtctl. Tailscale profiles: tailscale.'
 }
 
 main "$@"

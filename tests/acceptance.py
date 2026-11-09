@@ -53,6 +53,7 @@ class Acceptance(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         self.env = dict(os.environ, HOME=str(self.home), XDG_CONFIG_HOME=str(self.home/'config'), XDG_STATE_HOME=str(self.home/'state'))
+        self.env.pop('HERDR_BIN_PATH',None)
         bin_dir = self.home/'bin'
         bin_dir.mkdir()
         self.env['PATH'] = str(bin_dir)+os.pathsep+os.environ['PATH']
@@ -105,6 +106,20 @@ class Acceptance(unittest.TestCase):
         self.assertIn('Include',result.stdout)
         self.assertFalse((self.home/'.ssh/config').exists())
         self.assertFalse((self.home/'.ssh/hwatch.conf').exists())
+
+    def test_uses_host_herdr_binary_for_registration_and_removal(self):
+        host=self.home/'host tools/herdr'
+        host.parent.mkdir()
+        (self.home/'bin/herdr').rename(host)
+        (self.home/'bin/herdr').write_text('#!/bin/sh\necho wrong-herdr >&2\nexit 98\n')
+        (self.home/'bin/herdr').chmod(0o755)
+        self.env['HERDR_BIN_PATH']=str(host)
+        self.profile()
+        self.call('run','--once')
+        self.assertEqual(len(self.machines()),2)
+        self.call('profile','remove','lab',input='y\n')
+        self.assertEqual(len(self.machines()),1)
+        self.assertNotIn('wrong-herdr',self.call('doctor',ok=False).stdout)
 
     def test_reconcile_is_idempotent_and_preserves_failed_cluster(self):
         self.profile()

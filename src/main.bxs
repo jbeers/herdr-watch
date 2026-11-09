@@ -15,6 +15,10 @@ function paths() {
         sshConfig: home & "/.ssh/config"
     };
 }
+function herdrBin() {
+    var binary = getSystemSetting("HERDR_BIN_PATH", "");
+    return len(binary) ? binary : "herdr";
+}
 function fail(message) { throw(message); }
 function exec(name, args, timeout=30) {
     var r = systemExecute(name=name, arguments=args, timeout=timeout, terminateOnTimeout=true);
@@ -304,7 +308,7 @@ function discoverKubevirt(name, config, old) {
     return entries;
 }
 function machineList() {
-    var machines = deserializeJSON(exec("herdr",["machine","list","--json"]));
+    var machines = deserializeJSON(exec(herdrBin(),["machine","list","--json"]));
     if (!isArray(machines)) fail("Invalid Herdr machine list.");
     for (var machine in machines) {
         if (!structKeyExists(machine,"id") || !structKeyExists(machine,"target")) fail("Invalid Herdr machine record.");
@@ -324,7 +328,7 @@ function removeOwned(alias, entry, machines) {
     for (var machine in machines) {
         if (machine.id == entry.id) {
             if (machine.target != alias) fail("Herdr ID no longer targets " & alias & "; refusing removal.");
-            exec("herdr",["machine","remove",entry.id]);
+            exec(herdrBin(),["machine","remove",entry.id]);
             println("Removed " & alias);
         }
     }
@@ -347,7 +351,7 @@ function register(p, state, alias, entry, machines) {
     saveState(p,state);
     try {
         // stdin is closed by systemExecute; do not approve authentication or installation.
-        exec("herdr",["machine","add",alias,"--label",alias,"--remote-session","default"],60);
+        exec(herdrBin(),["machine","add",alias,"--label",alias,"--remote-session","default"],60);
         var updated = machineList();
         for (var machine in updated) {
             if (machine.target == alias && machine.session == "default") {
@@ -453,7 +457,8 @@ function doctor(p) {
     var configs = {};
     try { configs = loadProfiles(p); }
     catch (any e) { println("INVALID profile: " & e.message); ok = false; }
-    var tools = {herdr: true, ssh: true, mkdir: true, rmdir: true, rm: true, ps: true, sh: true};
+    var tools = {ssh: true, mkdir: true, rmdir: true, rm: true, ps: true, sh: true};
+    tools[herdrBin()] = true;
     for (var name in configs) {
         if (configs[name].type == "tailscale") tools.tailscale = true;
         else { tools.kubectl = true; tools.virtctl = true; }
@@ -469,9 +474,9 @@ function doctor(p) {
     }
     try {
         machineList();
-        var addHelp = exec("herdr",["machine","add","--help"]);
+        var addHelp = exec(herdrBin(),["machine","add","--help"]);
         if (!find("--remote-session",addHelp) || !find("--label",addHelp)) fail("Herdr is missing required machine-add options; update Herdr.");
-        exec("herdr",["machine","remove","--help"]);
+        exec(herdrBin(),["machine","remove","--help"]);
         println("OK: Herdr JSON machine catalog and machine commands");
     } catch (any e) { println("Herdr: " & e.message); ok = false; }
     var included = false;
@@ -523,6 +528,29 @@ function doctor(p) {
     println("Doctor made no changes. Machines need SSH access and a compatible Herdr server; hwatch never approves installation or host keys.");
     return ok;
 }
+function guide(p) {
+    println("hwatch setup and configuration");
+    println("Plugin actions: herdr plugin action invoke hwatch.<help|profile|doctor|version|run|watch>");
+    println("1. Install herdr, ssh, sh, mkdir, rmdir, rm, and ps on PATH.");
+    println("   KubeVirt also needs kubectl and virtctl; Tailscale needs tailscale and a logged-in daemon.");
+    println("2. Create a profile: hwatch profile new <name>, or use the hwatch.profile plugin menu.");
+    println("3. Run hwatch doctor; add its recommended Include near the top of your SSH config.");
+    println("4. Run hwatch run --once (plugin: hwatch.run), then hwatch run (plugin: hwatch.watch).");
+    println("   Watch runs in a visible terminal pane. Ctrl+C stops it; it is not a background service.");
+    println("Profiles (editable JSON): " & p.profiles);
+    println("State and shared run lock: " & p.state);
+    println("Generated SSH include (do not edit): " & p.ssh);
+    println("Your SSH config: " & p.sshConfig);
+    println("Use profile show/where to inspect configuration. Changes are reloaded on the next poll.");
+    println("Plugin and standalone runs share these paths, ownership journal, and lock.");
+    println("HERDR_PLUGIN_CONFIG_DIR/STATE_DIR do not override them; use the same HOME and XDG settings.");
+    println("Do not run separate watchers with different journals against the same SSH include.");
+    println("Plugin output: herdr plugin log list --plugin hwatch");
+    println("For direct CLI use, install standalone hwatch using the repository install.sh.");
+    println("Do not add Herdr's managed plugin checkout to PATH; its location can change on update.");
+    println("Stop the watcher before updating/uninstalling the plugin; reopen it after updating.");
+    println("Docs: https://github.com/jbeers/herdr-watch/tree/main/plugin");
+}
 function help() {
     println("hwatch — keep KubeVirt VMs and Tailscale machines in SSH and Herdr");
     println("Usage: hwatch <command> [args]");
@@ -533,6 +561,7 @@ function help() {
     println("  profile remove <name>        Remove profile and owned connections");
     println("  run [--once] [--poll-seconds 120]  Reconcile immediately, then poll");
     println("  doctor                       Read-only setup diagnostics");
+    println("  guide                        Setup, configuration paths, and plugin guidance");
     println("  --version                    Show version, commit, and UTC build date");
     println("  --help                       Show this help");
 }
@@ -553,6 +582,7 @@ function main() {
         if (option != "once" && option != "poll-seconds") fail("Unknown option: --" & option);
         if (words[1] != "run") fail("--" & option & " is only supported with run.");
     }
+    if (words[1] == "guide" && arrayLen(words) == 1) { guide(p); return 0; }
     if (words[1] == "doctor" && arrayLen(words) == 1) return doctor(p) ? 0 : 1;
     if (words[1] == "profile") {
         if (arrayLen(words) == 2 && words[2] == "list") {

@@ -3,9 +3,11 @@
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -79,6 +81,25 @@ class Installer(unittest.TestCase):
         requests=(self.home/'requests').read_text()
         self.assertNotIn('/latest',requests)
         self.assertIn('/download/v0.2.0/',requests)
+
+    def test_plugin_install_pins_manifest_release_and_keeps_binary_private(self):
+        self.env.update(TEST_OS='Linux',TEST_ARCH='x86_64',HWATCH_VERSION='v9.9.9')
+        self.release('linux-x64')
+        checkout=self.home/'checkout with spaces'
+        shutil.copytree(ROOT/'plugin',checkout/'plugin',ignore=shutil.ignore_patterns('bin'))
+        shutil.copy2(ROOT/'install.sh',checkout/'install.sh')
+        result=subprocess.run(['sh',str(checkout/'plugin/install.sh')],env=self.env,
+                              text=True,capture_output=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual((checkout/'plugin/bin/hwatch').read_bytes(),PAYLOAD)
+        self.assertFalse(self.bin.exists())
+        requests=(self.home/'requests').read_text()
+        version=tomllib.loads((ROOT/'plugin/herdr-plugin.toml').read_text())['version']
+        self.assertIn(f'/releases/download/v{version}/hwatch-linux-x64',requests)
+        self.assertNotIn('/latest',requests)
+        self.assertNotIn('/v9.9.9/',requests)
+        self.assertNotIn('Add this directory to PATH',result.stdout)
+        self.assertIn('hwatch.help',result.stdout)
 
     def test_missing_release_and_unsupported_system_do_not_install(self):
         self.env.update(TEST_OS='Linux',TEST_ARCH='x86_64')

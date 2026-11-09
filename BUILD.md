@@ -1,6 +1,33 @@
 # Local build record
 
-## Current artifact: build identity and interrupted-run lock recovery
+## Current artifact: Herdr plugin integration (prepared for v0.3.0)
+
+- Paths: `dist/hwatch` and `plugin/bin/hwatch` (generated, ignored by Git)
+- Target: `x86_64-unknown-linux-gnu`
+- SHA-256 (both copies): `94fed5ef045c0bbba6e6c6bc527bcb87ecc1ab845b617bfd839b3aabfc6da60e`
+- Embedded version/commit: `v0.2.2-dirty`, `beb6f76c042e95f51501993e83e9878c0fcd62d3` plus working tree changes
+- Built: `2026-11-08T08:04:28Z`
+- Same pinned MatchBox v0.12.0 compiler below; no MatchBox modules/native providers.
+
+Executed successfully:
+
+```sh
+MATCHBOX=/tmp/hwatch-matchbox-v012 python3 tests/acceptance.py
+MATCHBOX=/tmp/hwatch-matchbox-v012 python3 tests/source_free.py
+MATCHBOX=/tmp/hwatch-matchbox-v012 python3 tools/build.py --output dist/hwatch
+cp dist/hwatch plugin/bin/hwatch
+HWATCH_BIN="$PWD/dist/hwatch" python3 tests/acceptance.py
+HWATCH_BIN="$PWD/dist/hwatch" HERDR_TEST_BIN=/home/jacob/.local/bin/herdr python3 tests/plugin.py
+python3 tests/install.py
+for script in install.sh plugin/install.sh plugin/launch.sh; do sh -n "$script"; done
+git diff --check
+```
+
+All 15 core scenarios passed in source, source-free bytecode/native, and the final native artifact. All 5 plugin scenarios and 4 installer scenarios passed. The plugin tests use the real native CLI, disposable state, and controlled external inventory/Herdr substitutes for reconciliation. The optional real-host test used **Herdr 0.9.2** in a separate temporary HOME/config and named headless server: manifest link, action discovery, help/version log completion, actual profile action/pane creation, rendered terminal menu, and exit input all passed. It reproduced and fixed Herdr's rejection of an explicit workspace for overlay panes. The isolated server was stopped afterward; no real user plugin registration or live inventory was modified.
+
+The install wrapper was exercised against controlled downloads to verify the manifest release pin, checksum-verified installer reuse, private binary destination, and no standalone installation changes. Live GitHub plugin installation remains gated on publication of the v0.3.0 release assets. CI now tests the launcher with each native distributable and checks that tagged releases match the plugin manifest version. macOS/ARM64, actual GitHub installation, and the updated CI workflow were not run locally.
+
+## Previous artifact: build identity and interrupted-run lock recovery
 
 - Path/target: `dist/hwatch`, `x86_64-unknown-linux-gnu`
 - SHA-256: `88ce65fe0d2c7b03af1ee628a65784f58c713d3112c695d566c245658013546f`
